@@ -1,0 +1,50 @@
+export const DIFFICULTIES = [
+  {
+    key: 'easy',
+    label: '简单',
+    tagline: '轻松热身',
+    clueRange: [40, 45],
+    targetClues: 43,
+    scoreRange: [215, 310],
+    requireSearch: false,
+    maxSearchDepth: 0,
+    attempts: 80,
+  },
+  {
+    key: 'casual',
+    label: '业余',
+    tagline: '稳步推理',
+    clueRange: [34, 39],
+    targetClues: 37,
+    scoreRange: [285, 390],
+    requireSearch: false,
+    maxSearchDepth: 0,
+    attempts: 110,
+  },
+  {
+    key: 'expert',
+    label: '高手',
+    tagline: '候选组合',
+    clueRange: [29, 33],
+    targetClues: 31,
+    scoreRange: [360, 480],
+    requireSearch: false,
+    maxSearchDepth: 1,
+    attempts: 150,
+  },
+  {
+    key: 'master',
+    label: '骨灰级',
+    tagline: '高压挑战',
+    clueRange: [24, 28],
+    targetClues: 26,
+    scoreRange: [430, 700],
+    requireSearch: false,
+    maxSearchDepth: 4,
+    attempts: 180,
+  },
+];
+
+export const DIFFICULTY_BY_KEY = Object.fromEntries(
+  DIFFICULTIES.map((difficulty) => [difficulty.key, difficulty]),
+);

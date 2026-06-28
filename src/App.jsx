@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   CalendarDays,
   Check,
@@ -6,6 +6,7 @@ import {
   Eraser,
   Loader2,
   Medal,
+  Play,
   RefreshCw,
   Trophy,
   WifiOff,
@@ -87,7 +88,8 @@ export default function App() {
   const [puzzleData, setPuzzleData] = useState(null);
   const [board, setBoard] = useState(EMPTY_BOARD);
   const [selectedCell, setSelectedCell] = useState(0);
-  const [startedAt, setStartedAt] = useState(Date.now());
+  const [startedAt, setStartedAt] = useState(null);
+  const [hasStarted, setHasStarted] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [finishedMs, setFinishedMs] = useState(null);
   const [message, setMessage] = useState('');
@@ -98,13 +100,15 @@ export default function App() {
   const [playerId, setPlayerId] = useState('');
   const [submitStatus, setSubmitStatus] = useState('idle');
   const [submitError, setSubmitError] = useState('');
-  const boardRef = useRef(null);
 
   const difficulty = DIFFICULTY_BY_KEY[difficultyKey];
   const fixedCells = puzzleData?.puzzle ?? EMPTY_BOARD;
   const solution = puzzleData?.analysis.solution ?? EMPTY_BOARD;
   const puzzleKey = puzzleData?.puzzleKey ?? `${dateKey}:${difficultyKey}`;
-  const displayedTime = finishedMs ?? elapsedMs;
+  const isReadyToStart = Boolean(puzzleData) && !isGenerating && !hasStarted && finishedMs === null;
+  const canPlay = hasStarted && finishedMs === null && !isGenerating;
+  const canShowPuzzle = hasStarted || finishedMs !== null;
+  const displayedTime = finishedMs ?? (hasStarted ? elapsedMs : 0);
   const configured = hasLeaderboardConfig();
 
   const loadLeaderboard = useCallback(async () => {
@@ -141,10 +145,11 @@ export default function App() {
       setPuzzleData(generated);
       setBoard([...generated.puzzle]);
       setSelectedCell(findFirstEditable(generated.puzzle));
-      setStartedAt(Date.now());
+      setStartedAt(null);
+      setHasStarted(false);
       setElapsedMs(0);
       setFinishedMs(null);
-      setMessage(generated.generatedByFallback ? '已生成稳定唯一解题目。' : '');
+      setMessage('题目已就绪。');
       setIsGenerating(false);
       setIsSubmitOpen(false);
       setSubmitStatus('idle');
@@ -162,18 +167,32 @@ export default function App() {
   }, [loadLeaderboard]);
 
   useEffect(() => {
-    if (!puzzleData || finishedMs !== null || isGenerating) return undefined;
+    if (!puzzleData || !hasStarted || finishedMs !== null || isGenerating || startedAt === null) {
+      return undefined;
+    }
 
     const timer = window.setInterval(() => {
       setElapsedMs(Date.now() - startedAt);
     }, 120);
 
     return () => window.clearInterval(timer);
-  }, [finishedMs, isGenerating, puzzleData, startedAt]);
+  }, [finishedMs, hasStarted, isGenerating, puzzleData, startedAt]);
+
+  const handleStart = () => {
+    if (!puzzleData || isGenerating || hasStarted) return;
+
+    const now = Date.now();
+    setStartedAt(now);
+    setElapsedMs(0);
+    setFinishedMs(null);
+    setHasStarted(true);
+    setSelectedCell(findFirstEditable(fixedCells));
+    setMessage('');
+  };
 
   const setDigit = useCallback(
     (digit) => {
-      if (!puzzleData || finishedMs !== null) return;
+      if (!puzzleData || !hasStarted || finishedMs !== null) return;
       if (fixedCells[selectedCell]) return;
 
       setBoard((current) => {
@@ -183,14 +202,14 @@ export default function App() {
       });
       setMessage('');
     },
-    [finishedMs, fixedCells, puzzleData, selectedCell],
+    [finishedMs, fixedCells, hasStarted, puzzleData, selectedCell],
   );
 
   const clearCell = useCallback(() => setDigit(0), [setDigit]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
-      if (isSubmitOpen) return;
+      if (isSubmitOpen || !hasStarted || finishedMs !== null) return;
 
       if (/^[1-9]$/.test(event.key)) {
         event.preventDefault();
@@ -221,10 +240,15 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearCell, isSubmitOpen, selectedCell, setDigit]);
+  }, [clearCell, finishedMs, hasStarted, isSubmitOpen, selectedCell, setDigit]);
 
   const handleFinish = () => {
     if (!puzzleData || isGenerating) return;
+
+    if (!hasStarted || startedAt === null) {
+      setMessage('请先开始游戏。');
+      return;
+    }
 
     if (!isValidBoard(board) || hasConflicts(board)) {
       setMessage('当前棋盘存在冲突。');
@@ -340,37 +364,59 @@ export default function App() {
                 <span>正在生成唯一解题目</span>
               </div>
             ) : (
-              <div className="sudoku-board" ref={boardRef} role="grid" aria-label="数独棋盘">
-                {board.map((digit, cell) => {
-                  const fixed = Boolean(fixedCells[cell]);
-                  const selected = selectedCell === cell;
-                  const related = sameHouse(selectedCell, cell);
-                  const sameDigit = digit && digit === board[selectedCell];
-                  const className = [
-                    'cell',
-                    fixed ? 'fixed' : 'editable',
-                    selected ? 'selected' : '',
-                    related ? 'related' : '',
-                    sameDigit ? 'same-digit' : '',
-                    (cell + 1) % 3 === 0 && (cell + 1) % 9 !== 0 ? 'box-right' : '',
-                    Math.floor(cell / 9) % 3 === 2 && cell < 72 ? 'box-bottom' : '',
-                  ]
-                    .filter(Boolean)
-                    .join(' ');
+              <div className="sudoku-stage">
+                <div
+                  className={canShowPuzzle ? 'sudoku-board' : 'sudoku-board pending'}
+                  role="grid"
+                  aria-label="数独棋盘"
+                >
+                  {board.map((digit, cell) => {
+                    const fixed = canShowPuzzle && Boolean(fixedCells[cell]);
+                    const selected = canShowPuzzle && selectedCell === cell;
+                    const related = canShowPuzzle && sameHouse(selectedCell, cell);
+                    const sameDigit = canShowPuzzle && digit && digit === board[selectedCell];
+                    const className = [
+                      'cell',
+                      fixed ? 'fixed' : 'editable',
+                      selected ? 'selected' : '',
+                      related ? 'related' : '',
+                      sameDigit ? 'same-digit' : '',
+                      (cell + 1) % 3 === 0 && (cell + 1) % 9 !== 0 ? 'box-right' : '',
+                      Math.floor(cell / 9) % 3 === 2 && cell < 72 ? 'box-bottom' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ');
 
-                  return (
-                    <button
-                      aria-label={`第 ${Math.floor(cell / 9) + 1} 行第 ${(cell % 9) + 1} 列`}
-                      className={className}
-                      key={cell}
-                      role="gridcell"
-                      type="button"
-                      onClick={() => setSelectedCell(cell)}
-                    >
-                      {digit || ''}
-                    </button>
-                  );
-                })}
+                    return (
+                      <button
+                        aria-disabled={!canPlay}
+                        aria-label={`第 ${Math.floor(cell / 9) + 1} 行第 ${(cell % 9) + 1} 列`}
+                        className={className}
+                        key={cell}
+                        role="gridcell"
+                        tabIndex={canPlay ? 0 : -1}
+                        type="button"
+                        onClick={() => {
+                          if (canPlay) setSelectedCell(cell);
+                        }}
+                      >
+                        {canShowPuzzle && digit ? digit : ''}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {isReadyToStart && (
+                  <div className="start-overlay">
+                    <div className="start-panel">
+                      <p className="ready-title">今日题目已就绪</p>
+                      <button className="start-button" type="button" onClick={handleStart}>
+                        <Play size={20} aria-hidden="true" />
+                        开始游戏
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -379,7 +425,7 @@ export default function App() {
             {Array.from({ length: 9 }, (_, index) => index + 1).map((digit) => (
               <button
                 className="number-button"
-                disabled={isGenerating || finishedMs !== null}
+                disabled={!canPlay}
                 key={digit}
                 type="button"
                 onClick={() => setDigit(digit)}
@@ -389,7 +435,7 @@ export default function App() {
             ))}
             <button
               className="number-button clear"
-              disabled={isGenerating || finishedMs !== null}
+              disabled={!canPlay}
               type="button"
               onClick={clearCell}
               title="清除"
@@ -400,7 +446,7 @@ export default function App() {
           </div>
 
           <div className="action-row">
-            <button className="primary-button" type="button" onClick={handleFinish}>
+            <button className="primary-button" disabled={!canPlay} type="button" onClick={handleFinish}>
               <Check size={18} aria-hidden="true" />
               提交完成
             </button>

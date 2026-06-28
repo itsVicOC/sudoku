@@ -40,13 +40,15 @@ npm run build
 
 ```bash
 VITE_SUPABASE_URL=https://your-project-ref.supabase.co
-VITE_SUPABASE_ANON_KEY=your-public-anon-key
+VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_your-public-key
 ```
 
 GitHub Pages 部署时，在仓库 `Settings -> Secrets and variables -> Actions` 配置：
 
 - Variable: `VITE_SUPABASE_URL`
-- Secret: `VITE_SUPABASE_ANON_KEY`
+- Secret: `VITE_SUPABASE_PUBLISHABLE_KEY`
+
+新版 Supabase Dashboard 里显示的 `publishable key` 就是前端要用的 key。旧版 `anon` key 仍可作为 `VITE_SUPABASE_ANON_KEY` 使用，但 Supabase 已将它标记为 legacy。
 
 ## GitHub Pages
 

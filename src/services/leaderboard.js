@@ -1,8 +1,9 @@
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const SUPABASE_API_KEY =
+  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 function isConfigured() {
-  return Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+  return Boolean(SUPABASE_URL && SUPABASE_API_KEY);
 }
 
 function endpoint(functionName) {
@@ -14,13 +15,18 @@ async function callRpc(functionName, payload) {
     throw new Error('Supabase 尚未配置，无法读取或提交共享排行榜。');
   }
 
+  const headers = {
+    apikey: SUPABASE_API_KEY,
+    'Content-Type': 'application/json',
+  };
+
+  if (!SUPABASE_API_KEY.startsWith('sb_publishable_')) {
+    headers.Authorization = `Bearer ${SUPABASE_API_KEY}`;
+  }
+
   const response = await fetch(endpoint(functionName), {
     method: 'POST',
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify(payload),
   });
 

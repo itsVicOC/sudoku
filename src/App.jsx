@@ -6,21 +6,32 @@ import {
   Eraser,
   Loader2,
   Medal,
+  PencilLine,
   Play,
   RefreshCw,
   Trophy,
   WifiOff,
 } from 'lucide-react';
 import { DIFFICULTIES, DIFFICULTY_BY_KEY } from './game/difficulties.js';
+import {
+  applyDigitToNotes,
+  clearCellNotes,
+  createEmptyNotes,
+  getNoteDigits,
+  hasNote,
+  toggleNote,
+} from './game/notes.js';
 import { generatePuzzle, isBoardComplete, isValidBoard } from './game/sudoku.js';
 import {
   fetchLeaderboard,
   hasLeaderboardConfig,
   submitScore,
 } from './services/leaderboard.js';
-import { formatDuration, getShanghaiDateKey } from './utils/time.js';
+import { formatDuration, getPreviousDateKey, getShanghaiDateKey } from './utils/time.js';
 
 const EMPTY_BOARD = Array(81).fill(0);
+const PROGRESS_STORAGE_VERSION = 1;
+const PROGRESS_STORAGE_PREFIX = 'daily-sudoku-progress:';
 
 function sameHouse(a, b) {
   if (a < 0 || b < 0) return false;
@@ -80,13 +91,132 @@ function normalizePlayerId(value) {
   return value.trim().slice(0, 16);
 }
 
+function getProgressStorageKey(puzzleKey) {
+  return `${PROGRESS_STORAGE_PREFIX}${puzzleKey}`;
+}
+
+function isBoardShape(value) {
+  return (
+    Array.isArray(value) &&
+    value.length === 81 &&
+    value.every((digit) => Number.isInteger(digit) && digit >= 0 && digit <= 9)
+  );
+}
+
+function sanitizeNotes(value, board, fixedCells) {
+  return Array.from({ length: 81 }, (_, index) => {
+    if (fixedCells[index] || board[index]) return 0;
+
+    const mask = Array.isArray(value) ? value[index] : 0;
+    return Number.isInteger(mask) ? mask & 0x1ff : 0;
+  });
+}
+
+function readStoredProgress(puzzleKey, fixedCells) {
+  try {
+    const raw = window.localStorage.getItem(getProgressStorageKey(puzzleKey));
+    if (!raw) return null;
+
+    const payload = JSON.parse(raw);
+    if (payload.version !== PROGRESS_STORAGE_VERSION || payload.puzzleKey !== puzzleKey) {
+      return null;
+    }
+
+    if (!isBoardShape(payload.board)) return null;
+    if (fixedCells.some((digit, index) => digit && payload.board[index] !== digit)) return null;
+
+    const startedAt = Number(payload.startedAt);
+    if (payload.hasStarted !== true || !Number.isFinite(startedAt) || startedAt <= 0) {
+      return null;
+    }
+
+    const board = payload.board.map((digit, index) => (fixedCells[index] ? fixedCells[index] : digit));
+    return {
+      board,
+      hasStarted: true,
+      notes: sanitizeNotes(payload.notes, board, fixedCells),
+      startedAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredProgress(puzzleKey, progress) {
+  try {
+    window.localStorage.setItem(
+      getProgressStorageKey(puzzleKey),
+      JSON.stringify({
+        version: PROGRESS_STORAGE_VERSION,
+        puzzleKey,
+        board: progress.board,
+        notes: progress.notes,
+        hasStarted: progress.hasStarted,
+        startedAt: progress.startedAt,
+      }),
+    );
+  } catch {
+    // Ignore private browsing or quota failures; the game still works without persistence.
+  }
+}
+
+function clearStoredProgress(puzzleKey) {
+  try {
+    window.localStorage.removeItem(getProgressStorageKey(puzzleKey));
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function LeaderboardContent({ configured, emptyMessage, error, rows, status }) {
+  if (!configured) return null;
+
+  if (status === 'loading') {
+    return (
+      <div className="loading-list">
+        <Loader2 size={18} aria-hidden="true" />
+        <span>读取排行榜...</span>
+      </div>
+    );
+  }
+
+  if (status === 'error') {
+    return <div className="notice danger">{error}</div>;
+  }
+
+  if (status === 'ready' && rows.length === 0) {
+    return <div className="empty-list">{emptyMessage}</div>;
+  }
+
+  if (rows.length > 0) {
+    return (
+      <ol className="leaderboard-list">
+        {rows.map((row, index) => (
+          <li className="leaderboard-row" key={`${row.rank}-${row.player_id}-${row.time_ms}`}>
+            <span className={index < 3 ? 'rank podium' : 'rank'}>
+              {index < 3 ? <Medal size={16} aria-hidden="true" /> : row.rank}
+            </span>
+            <span className="player-id">{row.player_id}</span>
+            <span className="score-time">{formatDuration(row.time_ms)}</span>
+          </li>
+        ))}
+      </ol>
+    );
+  }
+
+  return null;
+}
+
 export default function App() {
   const dateKey = useMemo(() => getShanghaiDateKey(), []);
+  const maxHistoryDateKey = useMemo(() => getPreviousDateKey(dateKey), [dateKey]);
   const [difficultyKey, setDifficultyKey] = useState('easy');
   const [gameNonce, setGameNonce] = useState(0);
   const [isGenerating, setIsGenerating] = useState(true);
   const [puzzleData, setPuzzleData] = useState(null);
   const [board, setBoard] = useState(EMPTY_BOARD);
+  const [notes, setNotes] = useState(() => createEmptyNotes());
+  const [noteMode, setNoteMode] = useState(false);
   const [selectedCell, setSelectedCell] = useState(0);
   const [startedAt, setStartedAt] = useState(null);
   const [hasStarted, setHasStarted] = useState(false);
@@ -100,11 +230,16 @@ export default function App() {
   const [playerId, setPlayerId] = useState('');
   const [submitStatus, setSubmitStatus] = useState('idle');
   const [submitError, setSubmitError] = useState('');
+  const [historyDateKey, setHistoryDateKey] = useState(maxHistoryDateKey);
+  const [historyLeaderboard, setHistoryLeaderboard] = useState([]);
+  const [historyLeaderboardStatus, setHistoryLeaderboardStatus] = useState('loading');
+  const [historyLeaderboardError, setHistoryLeaderboardError] = useState('');
 
   const difficulty = DIFFICULTY_BY_KEY[difficultyKey];
   const fixedCells = puzzleData?.puzzle ?? EMPTY_BOARD;
   const solution = puzzleData?.analysis.solution ?? EMPTY_BOARD;
   const puzzleKey = puzzleData?.puzzleKey ?? `${dateKey}:${difficultyKey}`;
+  const historyPuzzleKey = `${historyDateKey}:${difficultyKey}`;
   const isReadyToStart = Boolean(puzzleData) && !isGenerating && !hasStarted && finishedMs === null;
   const canPlay = hasStarted && finishedMs === null && !isGenerating;
   const canShowPuzzle = hasStarted || finishedMs !== null;
@@ -132,6 +267,27 @@ export default function App() {
     }
   }, [configured, difficultyKey, puzzleData]);
 
+  const loadHistoryLeaderboard = useCallback(async () => {
+    if (!configured) {
+      setHistoryLeaderboardStatus('missing-config');
+      setHistoryLeaderboard([]);
+      return;
+    }
+
+    setHistoryLeaderboardStatus('loading');
+    setHistoryLeaderboardError('');
+
+    try {
+      const rows = await fetchLeaderboard(difficultyKey, historyPuzzleKey);
+      setHistoryLeaderboard(Array.isArray(rows) ? rows : []);
+      setHistoryLeaderboardStatus('ready');
+    } catch (error) {
+      setHistoryLeaderboard([]);
+      setHistoryLeaderboardError(error instanceof Error ? error.message : '历史榜单读取失败。');
+      setHistoryLeaderboardStatus('error');
+    }
+  }, [configured, difficultyKey, historyPuzzleKey]);
+
   useEffect(() => {
     let cancelled = false;
     setIsGenerating(true);
@@ -142,15 +298,19 @@ export default function App() {
 
       if (cancelled) return;
 
+      const savedProgress = readStoredProgress(generated.puzzleKey, generated.puzzle);
+
       setPuzzleData(generated);
-      setBoard([...generated.puzzle]);
+      setBoard(savedProgress?.board ?? [...generated.puzzle]);
+      setNotes(savedProgress?.notes ?? createEmptyNotes());
       setSelectedCell(findFirstEditable(generated.puzzle));
-      setStartedAt(null);
-      setHasStarted(false);
-      setElapsedMs(0);
+      setStartedAt(savedProgress?.startedAt ?? null);
+      setHasStarted(Boolean(savedProgress));
+      setElapsedMs(savedProgress ? Date.now() - savedProgress.startedAt : 0);
       setFinishedMs(null);
-      setMessage('题目已就绪。');
+      setMessage(savedProgress ? '已恢复未完成进度。' : '题目已就绪。');
       setIsGenerating(false);
+      setNoteMode(false);
       setIsSubmitOpen(false);
       setSubmitStatus('idle');
       setSubmitError('');
@@ -167,6 +327,10 @@ export default function App() {
   }, [loadLeaderboard]);
 
   useEffect(() => {
+    loadHistoryLeaderboard();
+  }, [loadHistoryLeaderboard]);
+
+  useEffect(() => {
     if (!puzzleData || !hasStarted || finishedMs !== null || isGenerating || startedAt === null) {
       return undefined;
     }
@@ -178,6 +342,24 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [finishedMs, hasStarted, isGenerating, puzzleData, startedAt]);
 
+  useEffect(() => {
+    if (!puzzleData || isGenerating || finishedMs !== null || !hasStarted || startedAt === null) {
+      return;
+    }
+
+    saveStoredProgress(puzzleKey, {
+      board,
+      notes,
+      hasStarted,
+      startedAt,
+    });
+  }, [board, finishedMs, hasStarted, isGenerating, notes, puzzleData, puzzleKey, startedAt]);
+
+  const handleRestart = () => {
+    clearStoredProgress(`${dateKey}:${difficultyKey}`);
+    setGameNonce((value) => value + 1);
+  };
+
   const handleStart = () => {
     if (!puzzleData || isGenerating || hasStarted) return;
 
@@ -186,6 +368,7 @@ export default function App() {
     setElapsedMs(0);
     setFinishedMs(null);
     setHasStarted(true);
+    setNoteMode(false);
     setSelectedCell(findFirstEditable(fixedCells));
     setMessage('');
   };
@@ -195,17 +378,42 @@ export default function App() {
       if (!puzzleData || !hasStarted || finishedMs !== null) return;
       if (fixedCells[selectedCell]) return;
 
+      if (noteMode) {
+        if (board[selectedCell]) return;
+
+        setNotes((current) => toggleNote(current, selectedCell, digit));
+        setMessage('');
+        return;
+      }
+
       setBoard((current) => {
         const next = [...current];
         next[selectedCell] = digit;
         return next;
       });
+      setNotes((current) => applyDigitToNotes(current, selectedCell, digit));
       setMessage('');
     },
-    [finishedMs, fixedCells, hasStarted, puzzleData, selectedCell],
+    [board, finishedMs, fixedCells, hasStarted, noteMode, puzzleData, selectedCell],
   );
 
-  const clearCell = useCallback(() => setDigit(0), [setDigit]);
+  const clearCell = useCallback(() => {
+    if (!puzzleData || !hasStarted || finishedMs !== null) return;
+    if (fixedCells[selectedCell]) return;
+
+    if (!noteMode) {
+      setBoard((current) => {
+        if (current[selectedCell] === 0) return current;
+
+        const next = [...current];
+        next[selectedCell] = 0;
+        return next;
+      });
+    }
+
+    setNotes((current) => clearCellNotes(current, selectedCell));
+    setMessage('');
+  }, [finishedMs, fixedCells, hasStarted, noteMode, puzzleData, selectedCell]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -269,7 +477,16 @@ export default function App() {
     setFinishedMs(finalTime);
     setElapsedMs(finalTime);
     setMessage('通关完成。');
+    setNoteMode(false);
+    clearStoredProgress(puzzleKey);
     setIsSubmitOpen(true);
+  };
+
+  const handleHistoryDateChange = (event) => {
+    const value = event.target.value;
+    if (!value) return;
+
+    setHistoryDateKey(value > maxHistoryDateKey ? maxHistoryDateKey : value);
   };
 
   const handleSubmitScore = async (event) => {
@@ -349,7 +566,7 @@ export default function App() {
             <button
               className="icon-button"
               type="button"
-              onClick={() => setGameNonce((value) => value + 1)}
+              onClick={handleRestart}
               title="重新开始今日题目"
               aria-label="重新开始今日题目"
             >
@@ -374,13 +591,16 @@ export default function App() {
                     const fixed = canShowPuzzle && Boolean(fixedCells[cell]);
                     const selected = canShowPuzzle && selectedCell === cell;
                     const related = canShowPuzzle && sameHouse(selectedCell, cell);
-                    const sameDigit = canShowPuzzle && digit && digit === board[selectedCell];
+                    const selectedDigit = canShowPuzzle ? board[selectedCell] : 0;
+                    const sameDigit = canShowPuzzle && digit && selectedDigit && digit === selectedDigit;
+                    const noteDigits = canShowPuzzle && !digit ? getNoteDigits(notes[cell]) : [];
                     const className = [
                       'cell',
                       fixed ? 'fixed' : 'editable',
                       selected ? 'selected' : '',
                       related ? 'related' : '',
                       sameDigit ? 'same-digit' : '',
+                      noteDigits.length > 0 ? 'has-notes' : '',
                       (cell + 1) % 3 === 0 && (cell + 1) % 9 !== 0 ? 'box-right' : '',
                       Math.floor(cell / 9) % 3 === 2 && cell < 72 ? 'box-bottom' : '',
                     ]
@@ -390,7 +610,13 @@ export default function App() {
                     return (
                       <button
                         aria-disabled={!canPlay}
-                        aria-label={`第 ${Math.floor(cell / 9) + 1} 行第 ${(cell % 9) + 1} 列`}
+                        aria-label={[
+                          `第 ${Math.floor(cell / 9) + 1} 行第 ${(cell % 9) + 1} 列`,
+                          digit ? `数字 ${digit}` : '',
+                          noteDigits.length > 0 ? `候选 ${noteDigits.join('、')}` : '',
+                        ]
+                          .filter(Boolean)
+                          .join('，')}
                         className={className}
                         key={cell}
                         role="gridcell"
@@ -400,7 +626,18 @@ export default function App() {
                           if (canPlay) setSelectedCell(cell);
                         }}
                       >
-                        {canShowPuzzle && digit ? digit : ''}
+                        {canShowPuzzle && digit ? (
+                          <span className="cell-digit">{digit}</span>
+                        ) : (
+                          canShowPuzzle &&
+                          noteDigits.length > 0 && (
+                            <span className="notes-grid" aria-hidden="true">
+                              {Array.from({ length: 9 }, (_, index) => index + 1).map((noteDigit) => (
+                                <span key={noteDigit}>{hasNote(notes[cell], noteDigit) ? noteDigit : ''}</span>
+                              ))}
+                            </span>
+                          )
+                        )}
                       </button>
                     );
                   })}
@@ -434,6 +671,18 @@ export default function App() {
               </button>
             ))}
             <button
+              className={noteMode ? 'number-button note-toggle active' : 'number-button note-toggle'}
+              disabled={!canPlay}
+              type="button"
+              onClick={() => setNoteMode((value) => !value)}
+              title="笔记模式"
+              aria-label={noteMode ? '关闭笔记模式' : '开启笔记模式'}
+              aria-pressed={noteMode}
+            >
+              <PencilLine size={18} aria-hidden="true" />
+              <span>笔记</span>
+            </button>
+            <button
               className="number-button clear"
               disabled={!canPlay}
               type="button"
@@ -454,55 +703,62 @@ export default function App() {
           </div>
         </section>
 
-        <aside className="leaderboard-panel" aria-label="今日排行榜">
-          <div className="panel-title">
-            <div>
-              <p className="eyebrow">今日榜单</p>
-              <h2>{difficulty.label}</h2>
+        <aside className="leaderboard-panel" aria-label="排行榜">
+          <section className="leaderboard-section" aria-label="今日排行榜">
+            <div className="panel-title">
+              <div>
+                <p className="eyebrow">今日榜单</p>
+                <h2>{difficulty.label}</h2>
+              </div>
+              <Trophy size={24} aria-hidden="true" />
             </div>
-            <Trophy size={24} aria-hidden="true" />
-          </div>
 
-          {!configured && (
-            <div className="notice">
-              <WifiOff size={18} aria-hidden="true" />
-              <span>配置 Supabase 环境变量后启用全网共享排行榜。</span>
+            {!configured && (
+              <div className="notice">
+                <WifiOff size={18} aria-hidden="true" />
+                <span>配置 Supabase 环境变量后启用全网共享排行榜。</span>
+              </div>
+            )}
+
+            <LeaderboardContent
+              configured={configured}
+              emptyMessage="今天还没有成绩。"
+              error={leaderboardError}
+              rows={leaderboard}
+              status={leaderboardStatus}
+            />
+
+            <div className="rules">
+              <span>同一 ID 只保留最快成绩。</span>
+              <span>每日 00:00 按中国时区换题。</span>
             </div>
-          )}
+          </section>
 
-          {leaderboardStatus === 'loading' && configured && (
-            <div className="loading-list">
-              <Loader2 size={18} aria-hidden="true" />
-              <span>读取排行榜...</span>
+          <section className="leaderboard-section history-section" aria-label="历史排行榜">
+            <div className="panel-title history-panel-title">
+              <div>
+                <p className="eyebrow">历史榜单</p>
+                <h2>{difficulty.label}</h2>
+                <p className="puzzle-key">{historyPuzzleKey}</p>
+              </div>
+              <input
+                aria-label="历史榜单日期"
+                className="history-date-input"
+                max={maxHistoryDateKey}
+                type="date"
+                value={historyDateKey}
+                onChange={handleHistoryDateChange}
+              />
             </div>
-          )}
 
-          {leaderboardStatus === 'error' && (
-            <div className="notice danger">{leaderboardError}</div>
-          )}
-
-          {leaderboardStatus === 'ready' && leaderboard.length === 0 && (
-            <div className="empty-list">今天还没有成绩。</div>
-          )}
-
-          {leaderboard.length > 0 && (
-            <ol className="leaderboard-list">
-              {leaderboard.map((row, index) => (
-                <li className="leaderboard-row" key={`${row.player_id}-${row.time_ms}`}>
-                  <span className={index < 3 ? 'rank podium' : 'rank'}>
-                    {index < 3 ? <Medal size={16} aria-hidden="true" /> : row.rank}
-                  </span>
-                  <span className="player-id">{row.player_id}</span>
-                  <span className="score-time">{formatDuration(row.time_ms)}</span>
-                </li>
-              ))}
-            </ol>
-          )}
-
-          <div className="rules">
-            <span>同一 ID 只保留最快成绩。</span>
-            <span>每日 00:00 按中国时区换题。</span>
-          </div>
+            <LeaderboardContent
+              configured={configured}
+              emptyMessage="这天还没有成绩。"
+              error={historyLeaderboardError}
+              rows={historyLeaderboard}
+              status={historyLeaderboardStatus}
+            />
+          </section>
         </aside>
       </div>
 

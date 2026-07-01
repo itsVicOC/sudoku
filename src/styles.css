@@ -173,6 +173,12 @@ h2 {
   gap: 14px;
 }
 
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .difficulty-name {
   margin: 0;
   color: #17201b;
@@ -350,11 +356,27 @@ h2 {
 .start-overlay {
   position: absolute;
   inset: 3px;
+  z-index: 3;
   display: grid;
   place-items: center;
   border-radius: 4px;
   background: rgba(248, 250, 246, 0.92);
   backdrop-filter: blur(5px);
+}
+
+.pause-overlay {
+  position: absolute;
+  inset: 3px;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  background:
+    linear-gradient(rgba(234, 240, 236, 0.92) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(234, 240, 236, 0.92) 1px, transparent 1px),
+    #f8faf6;
+  background-size: 28px 28px;
+  color: #16241b;
 }
 
 .start-panel {
@@ -365,11 +387,43 @@ h2 {
   text-align: center;
 }
 
+.pause-panel {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  min-width: min(290px, calc(100% - 44px));
+  border: 1px solid #d3ded5;
+  border-radius: 8px;
+  padding: 24px 20px;
+  background: #ffffff;
+  box-shadow: 0 18px 48px rgba(20, 31, 24, 0.14);
+  text-align: center;
+}
+
+.pause-panel svg {
+  color: #245c44;
+}
+
 .ready-title {
   margin: 0;
   color: #24382c;
   font-size: 1.08rem;
   font-weight: 900;
+}
+
+.pause-title {
+  margin: 0;
+  color: #16241b;
+  font-size: 1.35rem;
+  font-weight: 950;
+}
+
+.pause-time {
+  margin: 0 0 4px;
+  color: #516058;
+  font-size: 1rem;
+  font-weight: 850;
+  font-variant-numeric: tabular-nums;
 }
 
 .start-button {
@@ -410,7 +464,7 @@ h2 {
 
 .number-pad {
   display: grid;
-  grid-template-columns: repeat(12, minmax(38px, 1fr));
+  grid-template-columns: repeat(13, minmax(38px, 1fr));
   gap: 8px;
 }
 
@@ -433,6 +487,10 @@ h2 {
 
 .number-button.clear {
   color: #6d413d;
+}
+
+.number-button.undo-button {
+  color: #304e79;
 }
 
 .number-button.note-toggle {
@@ -717,6 +775,10 @@ h2 {
 
   .number-pad {
     grid-template-columns: repeat(6, minmax(38px, 1fr));
+  }
+
+  .number-button.clear {
+    grid-column: span 6;
   }
 
   .action-row {

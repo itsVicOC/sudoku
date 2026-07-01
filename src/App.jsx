@@ -6,10 +6,12 @@ import {
   Eraser,
   Loader2,
   Medal,
+  Pause,
   PencilLine,
   Play,
   RefreshCw,
   Trophy,
+  Undo2,
   WifiOff,
 } from 'lucide-react';
 import { DIFFICULTIES, DIFFICULTY_BY_KEY } from './game/difficulties.js';
@@ -21,6 +23,17 @@ import {
   hasNote,
   toggleNote,
 } from './game/notes.js';
+import {
+  createProgressPayload,
+  createUndoSnapshot,
+  getElapsedMs,
+  normalizeStoredProgress,
+  pauseTimer,
+  popUndoSnapshot,
+  pushUndoSnapshot,
+  resumeTimer,
+  startTimer,
+} from './game/progress.js';
 import { generatePuzzle, isBoardComplete, isValidBoard } from './game/sudoku.js';
 import {
   fetchLeaderboard,
@@ -30,7 +43,6 @@ import {
 import { formatDuration, getPreviousDateKey, getShanghaiDateKey } from './utils/time.js';
 
 const EMPTY_BOARD = Array(81).fill(0);
-const PROGRESS_STORAGE_VERSION = 1;
 const PROGRESS_STORAGE_PREFIX = 'daily-sudoku-progress:';
 
 function sameHouse(a, b) {
@@ -95,48 +107,13 @@ function getProgressStorageKey(puzzleKey) {
   return `${PROGRESS_STORAGE_PREFIX}${puzzleKey}`;
 }
 
-function isBoardShape(value) {
-  return (
-    Array.isArray(value) &&
-    value.length === 81 &&
-    value.every((digit) => Number.isInteger(digit) && digit >= 0 && digit <= 9)
-  );
-}
-
-function sanitizeNotes(value, board, fixedCells) {
-  return Array.from({ length: 81 }, (_, index) => {
-    if (fixedCells[index] || board[index]) return 0;
-
-    const mask = Array.isArray(value) ? value[index] : 0;
-    return Number.isInteger(mask) ? mask & 0x1ff : 0;
-  });
-}
-
 function readStoredProgress(puzzleKey, fixedCells) {
   try {
     const raw = window.localStorage.getItem(getProgressStorageKey(puzzleKey));
     if (!raw) return null;
 
     const payload = JSON.parse(raw);
-    if (payload.version !== PROGRESS_STORAGE_VERSION || payload.puzzleKey !== puzzleKey) {
-      return null;
-    }
-
-    if (!isBoardShape(payload.board)) return null;
-    if (fixedCells.some((digit, index) => digit && payload.board[index] !== digit)) return null;
-
-    const startedAt = Number(payload.startedAt);
-    if (payload.hasStarted !== true || !Number.isFinite(startedAt) || startedAt <= 0) {
-      return null;
-    }
-
-    const board = payload.board.map((digit, index) => (fixedCells[index] ? fixedCells[index] : digit));
-    return {
-      board,
-      hasStarted: true,
-      notes: sanitizeNotes(payload.notes, board, fixedCells),
-      startedAt,
-    };
+    return normalizeStoredProgress(payload, puzzleKey, fixedCells);
   } catch {
     return null;
   }
@@ -146,14 +123,7 @@ function saveStoredProgress(puzzleKey, progress) {
   try {
     window.localStorage.setItem(
       getProgressStorageKey(puzzleKey),
-      JSON.stringify({
-        version: PROGRESS_STORAGE_VERSION,
-        puzzleKey,
-        board: progress.board,
-        notes: progress.notes,
-        hasStarted: progress.hasStarted,
-        startedAt: progress.startedAt,
-      }),
+      JSON.stringify(createProgressPayload(puzzleKey, progress)),
     );
   } catch {
     // Ignore private browsing or quota failures; the game still works without persistence.
@@ -218,7 +188,10 @@ export default function App() {
   const [notes, setNotes] = useState(() => createEmptyNotes());
   const [noteMode, setNoteMode] = useState(false);
   const [selectedCell, setSelectedCell] = useState(0);
-  const [startedAt, setStartedAt] = useState(null);
+  const [runningStartedAt, setRunningStartedAt] = useState(null);
+  const [accumulatedElapsedMs, setAccumulatedElapsedMs] = useState(0);
+  const [isPaused, setIsPaused] = useState(false);
+  const [undoStack, setUndoStack] = useState([]);
   const [hasStarted, setHasStarted] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [finishedMs, setFinishedMs] = useState(null);
@@ -241,7 +214,10 @@ export default function App() {
   const puzzleKey = puzzleData?.puzzleKey ?? `${dateKey}:${difficultyKey}`;
   const historyPuzzleKey = `${historyDateKey}:${difficultyKey}`;
   const isReadyToStart = Boolean(puzzleData) && !isGenerating && !hasStarted && finishedMs === null;
-  const canPlay = hasStarted && finishedMs === null && !isGenerating;
+  const isGameActive = hasStarted && finishedMs === null && !isGenerating;
+  const canPlay = isGameActive && !isPaused;
+  const canTogglePause = isGameActive;
+  const canUndo = canPlay && undoStack.length > 0;
   const canShowPuzzle = hasStarted || finishedMs !== null;
   const displayedTime = finishedMs ?? (hasStarted ? elapsedMs : 0);
   const configured = hasLeaderboardConfig();
@@ -304,11 +280,20 @@ export default function App() {
       setBoard(savedProgress?.board ?? [...generated.puzzle]);
       setNotes(savedProgress?.notes ?? createEmptyNotes());
       setSelectedCell(findFirstEditable(generated.puzzle));
-      setStartedAt(savedProgress?.startedAt ?? null);
+      setRunningStartedAt(savedProgress?.runningStartedAt ?? null);
+      setAccumulatedElapsedMs(savedProgress?.accumulatedElapsedMs ?? 0);
+      setIsPaused(Boolean(savedProgress?.isPaused));
+      setUndoStack(savedProgress?.undoStack ?? []);
       setHasStarted(Boolean(savedProgress));
-      setElapsedMs(savedProgress ? Date.now() - savedProgress.startedAt : 0);
+      setElapsedMs(savedProgress ? getElapsedMs(savedProgress) : 0);
       setFinishedMs(null);
-      setMessage(savedProgress ? '已恢复未完成进度。' : '题目已就绪。');
+      setMessage(
+        savedProgress
+          ? savedProgress.isPaused
+            ? '已恢复暂停中的进度。'
+            : '已恢复未完成进度。'
+          : '题目已就绪。',
+      );
       setIsGenerating(false);
       setNoteMode(false);
       setIsSubmitOpen(false);
@@ -331,29 +316,59 @@ export default function App() {
   }, [loadHistoryLeaderboard]);
 
   useEffect(() => {
-    if (!puzzleData || !hasStarted || finishedMs !== null || isGenerating || startedAt === null) {
+    if (
+      !puzzleData ||
+      !hasStarted ||
+      finishedMs !== null ||
+      isGenerating ||
+      isPaused ||
+      runningStartedAt === null
+    ) {
       return undefined;
     }
 
     const timer = window.setInterval(() => {
-      setElapsedMs(Date.now() - startedAt);
+      setElapsedMs(getElapsedMs({ accumulatedElapsedMs, isPaused, runningStartedAt }));
     }, 120);
 
     return () => window.clearInterval(timer);
-  }, [finishedMs, hasStarted, isGenerating, puzzleData, startedAt]);
+  }, [
+    accumulatedElapsedMs,
+    finishedMs,
+    hasStarted,
+    isGenerating,
+    isPaused,
+    puzzleData,
+    runningStartedAt,
+  ]);
 
   useEffect(() => {
-    if (!puzzleData || isGenerating || finishedMs !== null || !hasStarted || startedAt === null) {
+    if (!puzzleData || isGenerating || finishedMs !== null || !hasStarted) {
       return;
     }
 
     saveStoredProgress(puzzleKey, {
+      accumulatedElapsedMs,
       board,
       notes,
       hasStarted,
-      startedAt,
+      isPaused,
+      runningStartedAt,
+      undoStack,
     });
-  }, [board, finishedMs, hasStarted, isGenerating, notes, puzzleData, puzzleKey, startedAt]);
+  }, [
+    accumulatedElapsedMs,
+    board,
+    finishedMs,
+    hasStarted,
+    isGenerating,
+    isPaused,
+    notes,
+    puzzleData,
+    puzzleKey,
+    runningStartedAt,
+    undoStack,
+  ]);
 
   const handleRestart = () => {
     clearStoredProgress(`${dateKey}:${difficultyKey}`);
@@ -364,18 +379,61 @@ export default function App() {
     if (!puzzleData || isGenerating || hasStarted) return;
 
     const now = Date.now();
-    setStartedAt(now);
+    const timer = startTimer(now);
+    setAccumulatedElapsedMs(timer.accumulatedElapsedMs);
+    setRunningStartedAt(timer.runningStartedAt);
+    setIsPaused(timer.isPaused);
     setElapsedMs(0);
     setFinishedMs(null);
     setHasStarted(true);
     setNoteMode(false);
+    setUndoStack([]);
     setSelectedCell(findFirstEditable(fixedCells));
     setMessage('');
   };
 
+  const handlePauseToggle = () => {
+    if (!canTogglePause) return;
+
+    if (isPaused) {
+      const timer = resumeTimer({ accumulatedElapsedMs, isPaused, runningStartedAt });
+      setAccumulatedElapsedMs(timer.accumulatedElapsedMs);
+      setRunningStartedAt(timer.runningStartedAt);
+      setIsPaused(timer.isPaused);
+      setMessage('');
+      return;
+    }
+
+    const timer = pauseTimer({ accumulatedElapsedMs, isPaused, runningStartedAt });
+    setAccumulatedElapsedMs(timer.accumulatedElapsedMs);
+    setElapsedMs(timer.accumulatedElapsedMs);
+    setRunningStartedAt(timer.runningStartedAt);
+    setIsPaused(timer.isPaused);
+    setNoteMode(false);
+    setMessage('已暂停。');
+  };
+
+  const recordUndoSnapshot = useCallback(() => {
+    const snapshot = createUndoSnapshot(board, notes, selectedCell);
+    setUndoStack((current) => pushUndoSnapshot(current, snapshot));
+  }, [board, notes, selectedCell]);
+
+  const handleUndo = () => {
+    if (!canUndo) return;
+
+    const { snapshot, undoStack: nextUndoStack } = popUndoSnapshot(undoStack);
+    if (!snapshot) return;
+
+    setBoard(snapshot.board);
+    setNotes(snapshot.notes);
+    setSelectedCell(snapshot.selectedCell);
+    setUndoStack(nextUndoStack);
+    setMessage('已撤回上一步。');
+  };
+
   const setDigit = useCallback(
     (digit) => {
-      if (!puzzleData || !hasStarted || finishedMs !== null) return;
+      if (!canPlay) return;
       if (fixedCells[selectedCell]) return;
 
       if (noteMode) {
@@ -386,6 +444,9 @@ export default function App() {
         return;
       }
 
+      if (board[selectedCell] === digit) return;
+
+      recordUndoSnapshot();
       setBoard((current) => {
         const next = [...current];
         next[selectedCell] = digit;
@@ -394,12 +455,20 @@ export default function App() {
       setNotes((current) => applyDigitToNotes(current, selectedCell, digit));
       setMessage('');
     },
-    [board, finishedMs, fixedCells, hasStarted, noteMode, puzzleData, selectedCell],
+    [board, canPlay, fixedCells, noteMode, recordUndoSnapshot, selectedCell],
   );
 
   const clearCell = useCallback(() => {
-    if (!puzzleData || !hasStarted || finishedMs !== null) return;
+    if (!canPlay) return;
     if (fixedCells[selectedCell]) return;
+
+    const hasBoardValue = board[selectedCell] !== 0;
+    const hasCellNotes = notes[selectedCell] !== 0;
+    if ((noteMode && !hasCellNotes) || (!noteMode && !hasBoardValue && !hasCellNotes)) {
+      return;
+    }
+
+    recordUndoSnapshot();
 
     if (!noteMode) {
       setBoard((current) => {
@@ -413,11 +482,11 @@ export default function App() {
 
     setNotes((current) => clearCellNotes(current, selectedCell));
     setMessage('');
-  }, [finishedMs, fixedCells, hasStarted, noteMode, puzzleData, selectedCell]);
+  }, [board, canPlay, fixedCells, noteMode, notes, recordUndoSnapshot, selectedCell]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
-      if (isSubmitOpen || !hasStarted || finishedMs !== null) return;
+      if (isSubmitOpen || !canPlay) return;
 
       if (/^[1-9]$/.test(event.key)) {
         event.preventDefault();
@@ -448,13 +517,18 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearCell, finishedMs, hasStarted, isSubmitOpen, selectedCell, setDigit]);
+  }, [canPlay, clearCell, isSubmitOpen, selectedCell, setDigit]);
 
   const handleFinish = () => {
     if (!puzzleData || isGenerating) return;
 
-    if (!hasStarted || startedAt === null) {
+    if (!hasStarted || (runningStartedAt === null && !isPaused)) {
       setMessage('请先开始游戏。');
+      return;
+    }
+
+    if (isPaused) {
+      setMessage('请先继续游戏。');
       return;
     }
 
@@ -473,11 +547,15 @@ export default function App() {
       return;
     }
 
-    const finalTime = Date.now() - startedAt;
+    const finalTime = getElapsedMs({ accumulatedElapsedMs, isPaused, runningStartedAt });
     setFinishedMs(finalTime);
+    setAccumulatedElapsedMs(finalTime);
+    setRunningStartedAt(null);
+    setIsPaused(false);
     setElapsedMs(finalTime);
     setMessage('通关完成。');
     setNoteMode(false);
+    setUndoStack([]);
     clearStoredProgress(puzzleKey);
     setIsSubmitOpen(true);
   };
@@ -563,15 +641,27 @@ export default function App() {
               <p className="difficulty-name">{difficulty.label}</p>
               <p className="puzzle-key">{puzzleKey}</p>
             </div>
-            <button
-              className="icon-button"
-              type="button"
-              onClick={handleRestart}
-              title="重新开始今日题目"
-              aria-label="重新开始今日题目"
-            >
-              <RefreshCw size={18} aria-hidden="true" />
-            </button>
+            <div className="toolbar-actions">
+              <button
+                className="icon-button"
+                disabled={!canTogglePause}
+                type="button"
+                onClick={handlePauseToggle}
+                title={isPaused ? '继续游戏' : '暂停游戏'}
+                aria-label={isPaused ? '继续游戏' : '暂停游戏'}
+              >
+                {isPaused ? <Play size={18} aria-hidden="true" /> : <Pause size={18} aria-hidden="true" />}
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                onClick={handleRestart}
+                title="重新开始今日题目"
+                aria-label="重新开始今日题目"
+              >
+                <RefreshCw size={18} aria-hidden="true" />
+              </button>
+            </div>
           </div>
 
           <div className="board-wrap">
@@ -612,7 +702,7 @@ export default function App() {
                         aria-disabled={!canPlay}
                         aria-label={[
                           `第 ${Math.floor(cell / 9) + 1} 行第 ${(cell % 9) + 1} 列`,
-                          digit ? `数字 ${digit}` : '',
+                          canShowPuzzle && digit ? `数字 ${digit}` : '',
                           noteDigits.length > 0 ? `候选 ${noteDigits.join('、')}` : '',
                         ]
                           .filter(Boolean)
@@ -654,6 +744,20 @@ export default function App() {
                     </div>
                   </div>
                 )}
+
+                {isPaused && (
+                  <div className="pause-overlay">
+                    <div className="pause-panel">
+                      <Clock3 size={34} aria-hidden="true" />
+                      <p className="pause-title">已暂停</p>
+                      <p className="pause-time">{formatDuration(displayedTime)}</p>
+                      <button className="start-button" type="button" onClick={handlePauseToggle}>
+                        <Play size={20} aria-hidden="true" />
+                        继续游戏
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -670,6 +774,16 @@ export default function App() {
                 {digit}
               </button>
             ))}
+            <button
+              className="number-button undo-button"
+              disabled={!canUndo}
+              type="button"
+              onClick={handleUndo}
+              title="撤回上一步"
+              aria-label="撤回上一步"
+            >
+              <Undo2 size={20} aria-hidden="true" />
+            </button>
             <button
               className={noteMode ? 'number-button note-toggle active' : 'number-button note-toggle'}
               disabled={!canPlay}

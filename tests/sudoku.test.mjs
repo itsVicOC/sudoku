@@ -8,6 +8,17 @@ import {
   hasNote,
   toggleNote,
 } from '../src/game/notes.js';
+import {
+  MAX_UNDO_STACK,
+  createUndoSnapshot,
+  getElapsedMs,
+  normalizeStoredProgress,
+  pauseTimer,
+  popUndoSnapshot,
+  pushUndoSnapshot,
+  resumeTimer,
+  startTimer,
+} from '../src/game/progress.js';
 import { analyzePuzzle, generatePuzzle } from '../src/game/sudoku.js';
 import { addDaysToDateKey, getPreviousDateKey, getShanghaiDateKey } from '../src/utils/time.js';
 
@@ -90,4 +101,87 @@ test('applying a digit clears same-unit candidate notes', () => {
   assert.equal(hasNote(next[9], 5), false);
   assert.equal(hasNote(next[10], 5), false);
   assert.equal(hasNote(next[40], 5), true);
+});
+
+test('timer helpers pause and resume without counting paused time', () => {
+  const started = startTimer(1000);
+  assert.equal(getElapsedMs(started, 2500), 1500);
+
+  const paused = pauseTimer(started, 2500);
+  assert.equal(paused.accumulatedElapsedMs, 1500);
+  assert.equal(paused.isPaused, true);
+  assert.equal(getElapsedMs(paused, 8000), 1500);
+
+  const resumed = resumeTimer(paused, 9000);
+  assert.equal(resumed.accumulatedElapsedMs, 1500);
+  assert.equal(resumed.isPaused, false);
+  assert.equal(getElapsedMs(resumed, 9800), 2300);
+});
+
+test('undo helpers restore the latest board snapshot and cap history', () => {
+  const notes = createEmptyNotes();
+  const firstBoard = Array(81).fill(0);
+  const secondBoard = Array(81).fill(0);
+  secondBoard[10] = 4;
+
+  let undoStack = [];
+  undoStack = pushUndoSnapshot(undoStack, createUndoSnapshot(firstBoard, notes, 10));
+  undoStack = pushUndoSnapshot(undoStack, createUndoSnapshot(secondBoard, notes, 11));
+
+  const popped = popUndoSnapshot(undoStack);
+  assert.equal(popped.snapshot.board[10], 4);
+  assert.equal(popped.snapshot.selectedCell, 11);
+  assert.equal(popped.undoStack.length, 1);
+
+  undoStack = [];
+  for (let index = 0; index < MAX_UNDO_STACK + 12; index += 1) {
+    undoStack = pushUndoSnapshot(undoStack, createUndoSnapshot(firstBoard, notes, index % 81));
+  }
+  assert.equal(undoStack.length, MAX_UNDO_STACK);
+});
+
+test('stored progress can migrate legacy v1 payloads and keep paused v2 time frozen', () => {
+  const fixedCells = Array(81).fill(0);
+  fixedCells[0] = 8;
+  const board = [...fixedCells];
+  board[10] = 5;
+
+  const legacy = normalizeStoredProgress(
+    {
+      version: 1,
+      puzzleKey: '2026-07-01:easy',
+      board,
+      notes: createEmptyNotes(),
+      hasStarted: true,
+      startedAt: 1000,
+    },
+    '2026-07-01:easy',
+    fixedCells,
+    5000,
+  );
+
+  assert.equal(legacy.runningStartedAt, 1000);
+  assert.equal(legacy.accumulatedElapsedMs, 0);
+  assert.equal(getElapsedMs(legacy, 5000), 4000);
+
+  const paused = normalizeStoredProgress(
+    {
+      version: 2,
+      puzzleKey: '2026-07-01:easy',
+      board,
+      notes: createEmptyNotes(),
+      hasStarted: true,
+      isPaused: true,
+      accumulatedElapsedMs: 3200,
+      runningStartedAt: null,
+      undoStack: [createUndoSnapshot(board, createEmptyNotes(), 10)],
+    },
+    '2026-07-01:easy',
+    fixedCells,
+    999999,
+  );
+
+  assert.equal(paused.isPaused, true);
+  assert.equal(getElapsedMs(paused, 999999), 3200);
+  assert.equal(paused.undoStack.length, 1);
 });

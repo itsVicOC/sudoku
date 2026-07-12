@@ -117,6 +117,31 @@ export function isValidBoard(board) {
   });
 }
 
+export function getConflictCells(board) {
+  const conflicts = new Set();
+
+  for (const unit of UNITS) {
+    const cellsByDigit = new Map();
+
+    for (const cell of unit) {
+      const digit = board[cell];
+      if (!digit) continue;
+
+      const cells = cellsByDigit.get(digit) ?? [];
+      cells.push(cell);
+      cellsByDigit.set(digit, cells);
+    }
+
+    for (const cells of cellsByDigit.values()) {
+      if (cells.length > 1) {
+        cells.forEach((cell) => conflicts.add(cell));
+      }
+    }
+  }
+
+  return conflicts;
+}
+
 function chooseEmptyCell(board) {
   let bestCell = -1;
   let bestMask = 0;

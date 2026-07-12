@@ -19,8 +19,13 @@ import {
   resumeTimer,
   startTimer,
 } from '../src/game/progress.js';
-import { analyzePuzzle, generatePuzzle } from '../src/game/sudoku.js';
-import { addDaysToDateKey, getPreviousDateKey, getShanghaiDateKey } from '../src/utils/time.js';
+import { analyzePuzzle, generatePuzzle, getConflictCells } from '../src/game/sudoku.js';
+import {
+  addDaysToDateKey,
+  formatDuration,
+  getPreviousDateKey,
+  getShanghaiDateKey,
+} from '../src/utils/time.js';
 
 test('Shanghai date key uses the requested calendar day', () => {
   const date = new Date('2026-06-27T16:30:00.000Z');
@@ -31,6 +36,20 @@ test('date keys can move across month and year boundaries', () => {
   assert.equal(addDaysToDateKey('2026-03-01', -1), '2026-02-28');
   assert.equal(addDaysToDateKey('2025-12-31', 1), '2026-01-01');
   assert.equal(getPreviousDateKey('2026-01-01'), '2025-12-31');
+});
+
+test('duration formatting can hide hundredths while a game is running', () => {
+  assert.equal(formatDuration(65_430), '01:05.43');
+  assert.equal(formatDuration(65_430, { showHundredths: false }), '01:05');
+});
+
+test('conflict detection returns every duplicated cell in a unit', () => {
+  const board = Array(81).fill(0);
+  board[0] = 7;
+  board[8] = 7;
+  board[9] = 7;
+
+  assert.deepEqual([...getConflictCells(board)].sort((a, b) => a - b), [0, 8, 9]);
 });
 
 test('daily puzzle generation is stable for the same date and difficulty', () => {

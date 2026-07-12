@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   CalendarDays,
   Check,
+  CheckCircle2,
   Clock3,
   Eraser,
   Loader2,
@@ -34,7 +36,12 @@ import {
   resumeTimer,
   startTimer,
 } from './game/progress.js';
-import { generatePuzzle, isBoardComplete, isValidBoard } from './game/sudoku.js';
+import {
+  generatePuzzle,
+  getConflictCells,
+  isBoardComplete,
+  isValidBoard,
+} from './game/sudoku.js';
 import {
   fetchLeaderboard,
   hasLeaderboardConfig,
@@ -44,6 +51,7 @@ import { formatDuration, getPreviousDateKey, getShanghaiDateKey } from './utils/
 
 const EMPTY_BOARD = Array(81).fill(0);
 const PROGRESS_STORAGE_PREFIX = 'daily-sudoku-progress:';
+const PLAYER_ID_STORAGE_KEY = 'daily-sudoku-player-id';
 
 function sameHouse(a, b) {
   if (a < 0 || b < 0) return false;
@@ -61,42 +69,24 @@ function findFirstEditable(puzzle) {
   return index === -1 ? 0 : index;
 }
 
-function hasConflicts(board) {
-  const units = [];
-
-  for (let index = 0; index < 9; index += 1) {
-    units.push(Array.from({ length: 9 }, (_, col) => index * 9 + col));
-    units.push(Array.from({ length: 9 }, (_, row) => row * 9 + index));
-  }
-
-  for (let box = 0; box < 9; box += 1) {
-    const top = Math.floor(box / 3) * 3;
-    const left = (box % 3) * 3;
-    units.push(
-      Array.from({ length: 9 }, (_, offset) => {
-        const row = top + Math.floor(offset / 3);
-        const col = left + (offset % 3);
-        return row * 9 + col;
-      }),
-    );
-  }
-
-  return units.some((unit) => {
-    const seen = new Set();
-
-    for (const cell of unit) {
-      const digit = board[cell];
-      if (!digit) continue;
-      if (seen.has(digit)) return true;
-      seen.add(digit);
-    }
-
-    return false;
-  });
-}
-
 function isSolved(board, solution) {
   return board.every((digit, index) => digit === solution[index]);
+}
+
+function readStoredPlayerId() {
+  try {
+    return normalizePlayerId(window.localStorage.getItem(PLAYER_ID_STORAGE_KEY) ?? '');
+  } catch {
+    return '';
+  }
+}
+
+function saveStoredPlayerId(playerId) {
+  try {
+    window.localStorage.setItem(PLAYER_ID_STORAGE_KEY, playerId);
+  } catch {
+    // Ignore storage failures; the score submission still succeeds.
+  }
 }
 
 function normalizePlayerId(value) {
@@ -136,6 +126,78 @@ function clearStoredProgress(puzzleKey) {
   } catch {
     // Ignore storage failures.
   }
+}
+
+function Dialog({ children, className, labelledBy, onClose }) {
+  const dialogRef = useRef(null);
+
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    const dialog = dialogRef.current;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    const getFocusable = () =>
+      dialog
+        ? [...dialog.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex="0"]')]
+        : [];
+
+    const focusable = getFocusable();
+    (focusable[0] ?? dialog)?.focus();
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+
+      if (event.key !== 'Tab') return;
+      const currentFocusable = getFocusable();
+      if (currentFocusable.length === 0) {
+        event.preventDefault();
+        dialog?.focus();
+        return;
+      }
+
+      const first = currentFocusable[0];
+      const last = currentFocusable[currentFocusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      if (previousFocus instanceof HTMLElement) previousFocus.focus();
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        aria-labelledby={labelledBy}
+        aria-modal="true"
+        className={className}
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
+        {children}
+      </div>
+    </div>
+  );
 }
 
 function LeaderboardContent({ configured, emptyMessage, error, rows, status }) {
@@ -178,6 +240,7 @@ function LeaderboardContent({ configured, emptyMessage, error, rows, status }) {
 }
 
 export default function App() {
+  const boardRef = useRef(null);
   const dateKey = useMemo(() => getShanghaiDateKey(), []);
   const maxHistoryDateKey = useMemo(() => getPreviousDateKey(dateKey), [dateKey]);
   const [difficultyKey, setDifficultyKey] = useState('easy');
@@ -200,9 +263,11 @@ export default function App() {
   const [leaderboardStatus, setLeaderboardStatus] = useState('loading');
   const [leaderboardError, setLeaderboardError] = useState('');
   const [isSubmitOpen, setIsSubmitOpen] = useState(false);
-  const [playerId, setPlayerId] = useState('');
+  const [playerId, setPlayerId] = useState(readStoredPlayerId);
   const [submitStatus, setSubmitStatus] = useState('idle');
   const [submitError, setSubmitError] = useState('');
+  const [scoreSubmitted, setScoreSubmitted] = useState(false);
+  const [confirmation, setConfirmation] = useState(null);
   const [historyDateKey, setHistoryDateKey] = useState(maxHistoryDateKey);
   const [historyLeaderboard, setHistoryLeaderboard] = useState([]);
   const [historyLeaderboardStatus, setHistoryLeaderboardStatus] = useState('loading');
@@ -220,23 +285,34 @@ export default function App() {
   const canUndo = canPlay && undoStack.length > 0;
   const canShowPuzzle = hasStarted || finishedMs !== null;
   const displayedTime = finishedMs ?? (hasStarted ? elapsedMs : 0);
+  const displayedTimerText = formatDuration(displayedTime, {
+    showHundredths: finishedMs !== null,
+  });
+  const conflictCells = useMemo(() => getConflictCells(board), [board]);
+  const isDialogOpen = isSubmitOpen || confirmation !== null;
   const configured = hasLeaderboardConfig();
+  const pendingDifficulty = confirmation?.difficultyKey
+    ? DIFFICULTY_BY_KEY[confirmation.difficultyKey]
+    : null;
 
-  const loadLeaderboard = useCallback(async () => {
+  const loadLeaderboard = useCallback(async ({ silent = false } = {}) => {
     if (!configured || !puzzleData) {
       setLeaderboardStatus(configured ? 'idle' : 'missing-config');
       setLeaderboard([]);
       return;
     }
 
-    setLeaderboardStatus('loading');
-    setLeaderboardError('');
+    if (!silent) {
+      setLeaderboardStatus('loading');
+      setLeaderboardError('');
+    }
 
     try {
       const rows = await fetchLeaderboard(difficultyKey, puzzleData.puzzleKey);
       setLeaderboard(Array.isArray(rows) ? rows : []);
       setLeaderboardStatus('ready');
     } catch (error) {
+      if (silent) return;
       setLeaderboard([]);
       setLeaderboardError(error instanceof Error ? error.message : '排行榜读取失败。');
       setLeaderboardStatus('error');
@@ -299,6 +375,8 @@ export default function App() {
       setIsSubmitOpen(false);
       setSubmitStatus('idle');
       setSubmitError('');
+      setScoreSubmitted(false);
+      setConfirmation(null);
     }, 30);
 
     return () => {
@@ -316,6 +394,21 @@ export default function App() {
   }, [loadHistoryLeaderboard]);
 
   useEffect(() => {
+    if (!configured || !puzzleData) return undefined;
+
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') loadLeaderboard({ silent: true });
+    };
+    const interval = window.setInterval(refreshWhenVisible, 60_000);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+    };
+  }, [configured, loadLeaderboard, puzzleData]);
+
+  useEffect(() => {
     if (
       !puzzleData ||
       !hasStarted ||
@@ -329,7 +422,7 @@ export default function App() {
 
     const timer = window.setInterval(() => {
       setElapsedMs(getElapsedMs({ accumulatedElapsedMs, isPaused, runningStartedAt }));
-    }, 120);
+    }, 250);
 
     return () => window.clearInterval(timer);
   }, [
@@ -370,10 +463,13 @@ export default function App() {
     undoStack,
   ]);
 
-  const handleRestart = () => {
+  const restartGame = useCallback(() => {
     clearStoredProgress(`${dateKey}:${difficultyKey}`);
     setGameNonce((value) => value + 1);
-  };
+  }, [dateKey, difficultyKey]);
+
+  const closeConfirmation = useCallback(() => setConfirmation(null), []);
+  const closeSubmitDialog = useCallback(() => setIsSubmitOpen(false), []);
 
   const handleStart = () => {
     if (!puzzleData || isGenerating || hasStarted) return;
@@ -392,18 +488,8 @@ export default function App() {
     setMessage('');
   };
 
-  const handlePauseToggle = () => {
-    if (!canTogglePause) return;
-
-    if (isPaused) {
-      const timer = resumeTimer({ accumulatedElapsedMs, isPaused, runningStartedAt });
-      setAccumulatedElapsedMs(timer.accumulatedElapsedMs);
-      setRunningStartedAt(timer.runningStartedAt);
-      setIsPaused(timer.isPaused);
-      setMessage('');
-      return;
-    }
-
+  const pauseCurrentGame = useCallback(() => {
+    if (!canTogglePause || isPaused) return;
     const timer = pauseTimer({ accumulatedElapsedMs, isPaused, runningStartedAt });
     setAccumulatedElapsedMs(timer.accumulatedElapsedMs);
     setElapsedMs(timer.accumulatedElapsedMs);
@@ -411,6 +497,56 @@ export default function App() {
     setIsPaused(timer.isPaused);
     setNoteMode(false);
     setMessage('已暂停。');
+  }, [accumulatedElapsedMs, canTogglePause, isPaused, runningStartedAt]);
+
+  const handlePauseToggle = () => {
+    if (!canTogglePause) return;
+
+    if (!isPaused) {
+      pauseCurrentGame();
+      return;
+    }
+
+    const timer = resumeTimer({ accumulatedElapsedMs, isPaused, runningStartedAt });
+    setAccumulatedElapsedMs(timer.accumulatedElapsedMs);
+    setRunningStartedAt(timer.runningStartedAt);
+    setIsPaused(timer.isPaused);
+    setMessage('');
+  };
+
+  const requestRestart = () => {
+    if (isGameActive || (finishedMs !== null && !scoreSubmitted)) {
+      if (!isPaused && isGameActive) pauseCurrentGame();
+      setConfirmation({ type: 'restart' });
+      return;
+    }
+
+    restartGame();
+  };
+
+  const handleDifficultySelect = (nextDifficultyKey) => {
+    if (nextDifficultyKey === difficultyKey || isGenerating) return;
+
+    if (isGameActive || (finishedMs !== null && !scoreSubmitted)) {
+      if (!isPaused && isGameActive) pauseCurrentGame();
+      setConfirmation({ type: 'difficulty', difficultyKey: nextDifficultyKey });
+      return;
+    }
+
+    setDifficultyKey(nextDifficultyKey);
+  };
+
+  const confirmPendingAction = () => {
+    if (confirmation?.type === 'difficulty') {
+      setDifficultyKey(confirmation.difficultyKey);
+      setConfirmation(null);
+      return;
+    }
+
+    if (confirmation?.type === 'restart') {
+      setConfirmation(null);
+      restartGame();
+    }
   };
 
   const recordUndoSnapshot = useCallback(() => {
@@ -418,7 +554,7 @@ export default function App() {
     setUndoStack((current) => pushUndoSnapshot(current, snapshot));
   }, [board, notes, selectedCell]);
 
-  const handleUndo = () => {
+  const handleUndo = useCallback(() => {
     if (!canUndo) return;
 
     const { snapshot, undoStack: nextUndoStack } = popUndoSnapshot(undoStack);
@@ -429,7 +565,7 @@ export default function App() {
     setSelectedCell(snapshot.selectedCell);
     setUndoStack(nextUndoStack);
     setMessage('已撤回上一步。');
-  };
+  }, [canUndo, undoStack]);
 
   const setDigit = useCallback(
     (digit) => {
@@ -447,13 +583,15 @@ export default function App() {
       if (board[selectedCell] === digit) return;
 
       recordUndoSnapshot();
-      setBoard((current) => {
-        const next = [...current];
-        next[selectedCell] = digit;
-        return next;
-      });
+      const nextBoard = [...board];
+      nextBoard[selectedCell] = digit;
+      setBoard(nextBoard);
       setNotes((current) => applyDigitToNotes(current, selectedCell, digit));
-      setMessage('');
+      setMessage(
+        getConflictCells(nextBoard).has(selectedCell)
+          ? '这个数字与当前行、列或宫内的数字冲突。'
+          : '',
+      );
     },
     [board, canPlay, fixedCells, noteMode, recordUndoSnapshot, selectedCell],
   );
@@ -486,7 +624,27 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event) => {
-      if (isSubmitOpen || !canPlay) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.matches('input, textarea, select') || target.isContentEditable)
+      ) {
+        return;
+      }
+      if (isDialogOpen || !canPlay) return;
+
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
+        event.preventDefault();
+        handleUndo();
+        return;
+      }
+
+      if (!event.metaKey && !event.ctrlKey && event.key.toLowerCase() === 'n') {
+        event.preventDefault();
+        setNoteMode((value) => !value);
+        setMessage('');
+        return;
+      }
 
       if (/^[1-9]$/.test(event.key)) {
         event.preventDefault();
@@ -512,12 +670,15 @@ export default function App() {
       if (next !== selectedCell) {
         event.preventDefault();
         setSelectedCell(next);
+        window.requestAnimationFrame(() => {
+          boardRef.current?.querySelector(`[data-cell="${next}"]`)?.focus();
+        });
       }
     };
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [canPlay, clearCell, isSubmitOpen, selectedCell, setDigit]);
+  }, [canPlay, clearCell, handleUndo, isDialogOpen, selectedCell, setDigit]);
 
   const handleFinish = () => {
     if (!puzzleData || isGenerating) return;
@@ -532,7 +693,7 @@ export default function App() {
       return;
     }
 
-    if (!isValidBoard(board) || hasConflicts(board)) {
+    if (!isValidBoard(board) || conflictCells.size > 0) {
       setMessage('当前棋盘存在冲突。');
       return;
     }
@@ -556,6 +717,7 @@ export default function App() {
     setMessage('通关完成。');
     setNoteMode(false);
     setUndoStack([]);
+    setScoreSubmitted(false);
     clearStoredProgress(puzzleKey);
     setIsSubmitOpen(true);
   };
@@ -593,8 +755,11 @@ export default function App() {
       });
       setSubmitStatus('saved');
       setPlayerId(cleanId);
+      saveStoredPlayerId(cleanId);
+      setScoreSubmitted(true);
+      setMessage('成绩已提交至今日榜单。');
       setIsSubmitOpen(false);
-      await loadLeaderboard();
+      await loadLeaderboard({ silent: true });
     } catch (error) {
       setSubmitStatus('idle');
       setSubmitError(error instanceof Error ? error.message : '成绩提交失败。');
@@ -615,7 +780,7 @@ export default function App() {
           </div>
           <div className="metric timer">
             <Clock3 size={18} aria-hidden="true" />
-            <span>{formatDuration(displayedTime)}</span>
+            <span>{displayedTimerText}</span>
           </div>
         </div>
       </section>
@@ -624,9 +789,10 @@ export default function App() {
         {DIFFICULTIES.map((item) => (
           <button
             className={item.key === difficultyKey ? 'difficulty-tab active' : 'difficulty-tab'}
+            aria-pressed={item.key === difficultyKey}
             key={item.key}
             type="button"
-            onClick={() => setDifficultyKey(item.key)}
+            onClick={() => handleDifficultySelect(item.key)}
           >
             <span>{item.label}</span>
             <small>{item.tagline}</small>
@@ -655,7 +821,7 @@ export default function App() {
               <button
                 className="icon-button"
                 type="button"
-                onClick={handleRestart}
+                onClick={requestRestart}
                 title="重新开始今日题目"
                 aria-label="重新开始今日题目"
               >
@@ -673,7 +839,10 @@ export default function App() {
             ) : (
               <div className="sudoku-stage">
                 <div
+                  aria-hidden={isPaused || undefined}
                   className={canShowPuzzle ? 'sudoku-board' : 'sudoku-board pending'}
+                  inert={isPaused}
+                  ref={boardRef}
                   role="grid"
                   aria-label="数独棋盘"
                 >
@@ -683,6 +852,7 @@ export default function App() {
                     const related = canShowPuzzle && sameHouse(selectedCell, cell);
                     const selectedDigit = canShowPuzzle ? board[selectedCell] : 0;
                     const sameDigit = canShowPuzzle && digit && selectedDigit && digit === selectedDigit;
+                    const conflict = canShowPuzzle && conflictCells.has(cell);
                     const noteDigits = canShowPuzzle && !digit ? getNoteDigits(notes[cell]) : [];
                     const className = [
                       'cell',
@@ -690,6 +860,7 @@ export default function App() {
                       selected ? 'selected' : '',
                       related ? 'related' : '',
                       sameDigit ? 'same-digit' : '',
+                      conflict ? 'conflict' : '',
                       noteDigits.length > 0 ? 'has-notes' : '',
                       (cell + 1) % 3 === 0 && (cell + 1) % 9 !== 0 ? 'box-right' : '',
                       Math.floor(cell / 9) % 3 === 2 && cell < 72 ? 'box-bottom' : '',
@@ -700,17 +871,20 @@ export default function App() {
                     return (
                       <button
                         aria-disabled={!canPlay}
+                        aria-invalid={conflict || undefined}
                         aria-label={[
                           `第 ${Math.floor(cell / 9) + 1} 行第 ${(cell % 9) + 1} 列`,
                           canShowPuzzle && digit ? `数字 ${digit}` : '',
+                          conflict ? '存在冲突' : '',
                           noteDigits.length > 0 ? `候选 ${noteDigits.join('、')}` : '',
                         ]
                           .filter(Boolean)
                           .join('，')}
                         className={className}
+                        data-cell={cell}
                         key={cell}
                         role="gridcell"
-                        tabIndex={canPlay ? 0 : -1}
+                        tabIndex={canPlay && selected ? 0 : -1}
                         type="button"
                         onClick={() => {
                           if (canPlay) setSelectedCell(cell);
@@ -746,11 +920,11 @@ export default function App() {
                 )}
 
                 {isPaused && (
-                  <div className="pause-overlay">
+                  <div aria-labelledby="pause-title" className="pause-overlay" role="region">
                     <div className="pause-panel">
                       <Clock3 size={34} aria-hidden="true" />
-                      <p className="pause-title">已暂停</p>
-                      <p className="pause-time">{formatDuration(displayedTime)}</p>
+                      <p className="pause-title" id="pause-title">已暂停</p>
+                      <p className="pause-time">{displayedTimerText}</p>
                       <button className="start-button" type="button" onClick={handlePauseToggle}>
                         <Play size={20} aria-hidden="true" />
                         继续游戏
@@ -762,58 +936,87 @@ export default function App() {
             )}
           </div>
 
-          <div className="number-pad" aria-label="数字输入">
-            {Array.from({ length: 9 }, (_, index) => index + 1).map((digit) => (
+          <div className="control-area">
+            <div className="number-pad" aria-label="数字输入">
+              {Array.from({ length: 9 }, (_, index) => index + 1).map((digit) => (
+                <button
+                  aria-label={`输入数字 ${digit}`}
+                  className="number-button"
+                  disabled={!canPlay}
+                  key={digit}
+                  type="button"
+                  onClick={() => setDigit(digit)}
+                >
+                  {digit}
+                </button>
+              ))}
+            </div>
+            <div className="tool-pad" aria-label="棋盘工具">
               <button
-                className="number-button"
-                disabled={!canPlay}
-                key={digit}
+                className="tool-button undo-button"
+                disabled={!canUndo}
                 type="button"
-                onClick={() => setDigit(digit)}
+                onClick={handleUndo}
+                title="撤回上一步（Ctrl/Cmd + Z）"
+                aria-label="撤回上一步"
               >
-                {digit}
+                <Undo2 size={20} aria-hidden="true" />
+                <span>撤回</span>
               </button>
-            ))}
-            <button
-              className="number-button undo-button"
-              disabled={!canUndo}
-              type="button"
-              onClick={handleUndo}
-              title="撤回上一步"
-              aria-label="撤回上一步"
-            >
-              <Undo2 size={20} aria-hidden="true" />
-            </button>
-            <button
-              className={noteMode ? 'number-button note-toggle active' : 'number-button note-toggle'}
-              disabled={!canPlay}
-              type="button"
-              onClick={() => setNoteMode((value) => !value)}
-              title="笔记模式"
-              aria-label={noteMode ? '关闭笔记模式' : '开启笔记模式'}
-              aria-pressed={noteMode}
-            >
-              <PencilLine size={18} aria-hidden="true" />
-              <span>笔记</span>
-            </button>
-            <button
-              className="number-button clear"
-              disabled={!canPlay}
-              type="button"
-              onClick={clearCell}
-              title="清除"
-              aria-label="清除"
-            >
-              <Eraser size={20} aria-hidden="true" />
-            </button>
+              <button
+                className={noteMode ? 'tool-button note-toggle active' : 'tool-button note-toggle'}
+                disabled={!canPlay}
+                type="button"
+                onClick={() => setNoteMode((value) => !value)}
+                title="笔记模式（N）"
+                aria-label={noteMode ? '关闭笔记模式' : '开启笔记模式'}
+                aria-pressed={noteMode}
+              >
+                <PencilLine size={18} aria-hidden="true" />
+                <span>笔记</span>
+              </button>
+              <button
+                className="tool-button clear"
+                disabled={!canPlay}
+                type="button"
+                onClick={clearCell}
+                title="清除"
+                aria-label="清除"
+              >
+                <Eraser size={20} aria-hidden="true" />
+                <span>清除</span>
+              </button>
+            </div>
           </div>
 
           <div className="action-row">
-            <button className="primary-button" disabled={!canPlay} type="button" onClick={handleFinish}>
-              <Check size={18} aria-hidden="true" />
-              提交完成
-            </button>
-            <span className="status-line">{message}</span>
+            {finishedMs !== null ? (
+              <div className="result-actions">
+                <button
+                  className="primary-button"
+                  disabled={scoreSubmitted}
+                  type="button"
+                  onClick={() => setIsSubmitOpen(true)}
+                >
+                  {scoreSubmitted ? (
+                    <CheckCircle2 size={18} aria-hidden="true" />
+                  ) : (
+                    <Trophy size={18} aria-hidden="true" />
+                  )}
+                  {scoreSubmitted ? '成绩已提交' : '提交成绩'}
+                </button>
+                <button className="secondary-button" type="button" onClick={requestRestart}>
+                  <RefreshCw size={17} aria-hidden="true" />
+                  再来一局
+                </button>
+              </div>
+            ) : (
+              <button className="primary-button" disabled={!canPlay} type="button" onClick={handleFinish}>
+                <Check size={18} aria-hidden="true" />
+                提交完成
+              </button>
+            )}
+            <span aria-live="polite" className="status-line" role="status">{message}</span>
           </div>
         </section>
 
@@ -824,7 +1027,23 @@ export default function App() {
                 <p className="eyebrow">今日榜单</p>
                 <h2>{difficulty.label}</h2>
               </div>
-              <Trophy size={24} aria-hidden="true" />
+              <div className="panel-actions">
+                <button
+                  aria-label="刷新今日排行榜"
+                  className="icon-button compact"
+                  disabled={!configured || leaderboardStatus === 'loading'}
+                  onClick={() => loadLeaderboard()}
+                  title="刷新今日排行榜"
+                  type="button"
+                >
+                  {leaderboardStatus === 'loading' ? (
+                    <Loader2 className="spin-icon" size={17} aria-hidden="true" />
+                  ) : (
+                    <RefreshCw size={17} aria-hidden="true" />
+                  )}
+                </button>
+                <Trophy size={24} aria-hidden="true" />
+              </div>
             </div>
 
             {!configured && (
@@ -877,15 +1096,15 @@ export default function App() {
       </div>
 
       {isSubmitOpen && (
-        <div className="modal-backdrop" role="presentation">
-          <form className="score-modal" onSubmit={handleSubmitScore}>
+        <Dialog className="score-modal" labelledBy="score-dialog-title" onClose={closeSubmitDialog}>
+          <form onSubmit={handleSubmitScore}>
             <div>
               <p className="eyebrow">通关成绩</p>
-              <h2>{formatDuration(finishedMs)}</h2>
+              <h2 id="score-dialog-title">{formatDuration(finishedMs)}</h2>
             </div>
             <label htmlFor="player-id">玩家 ID</label>
             <input
-              autoFocus
+              autoComplete="nickname"
               id="player-id"
               maxLength={16}
               placeholder="1-16 个字符"
@@ -894,7 +1113,12 @@ export default function App() {
             />
             {submitError && <p className="form-error">{submitError}</p>}
             <div className="modal-actions">
-              <button className="secondary-button" type="button" onClick={() => setIsSubmitOpen(false)}>
+              <button
+                className="secondary-button"
+                disabled={submitStatus === 'saving'}
+                type="button"
+                onClick={closeSubmitDialog}
+              >
                 暂不提交
               </button>
               <button className="primary-button" disabled={submitStatus === 'saving'} type="submit">
@@ -902,7 +1126,34 @@ export default function App() {
               </button>
             </div>
           </form>
-        </div>
+        </Dialog>
+      )}
+
+      {confirmation && (
+        <Dialog className="confirm-modal" labelledBy="confirm-dialog-title" onClose={closeConfirmation}>
+          <AlertTriangle size={30} aria-hidden="true" />
+          <div>
+            <p className="eyebrow">确认操作</p>
+            <h2 id="confirm-dialog-title">
+              {confirmation.type === 'difficulty' ? `切换到${pendingDifficulty?.label}` : '重新开始今日题目'}
+            </h2>
+          </div>
+          <p className="confirm-copy">
+            {confirmation.type === 'difficulty'
+              ? '当前进度已经保存并暂停，切换后可以稍后回来继续。'
+              : finishedMs !== null && !scoreSubmitted
+                ? '当前成绩还没有提交到排行榜，重新开始后将无法再次提交这次成绩。'
+                : '当前填写进度和计时将被清除。'}
+          </p>
+          <div className="modal-actions">
+            <button className="secondary-button" type="button" onClick={closeConfirmation}>
+              返回
+            </button>
+            <button className="danger-button" type="button" onClick={confirmPendingAction}>
+              {confirmation.type === 'difficulty' ? '确认切换' : '重新开始'}
+            </button>
+          </div>
+        </Dialog>
       )}
     </main>
   );

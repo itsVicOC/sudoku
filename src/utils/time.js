@@ -28,7 +28,7 @@ export function getPreviousDateKey(dateKey = getShanghaiDateKey()) {
   return addDaysToDateKey(dateKey, -1);
 }
 
-export function formatDuration(milliseconds) {
+export function formatDuration(milliseconds, { showHundredths = true } = {}) {
   const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
@@ -40,5 +40,6 @@ export function formatDuration(milliseconds) {
     return `${hours}:${String(restMinutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
   }
 
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(hundredths).padStart(2, '0')}`;
+  const base = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  return showHundredths ? `${base}.${String(hundredths).padStart(2, '0')}` : base;
 }
